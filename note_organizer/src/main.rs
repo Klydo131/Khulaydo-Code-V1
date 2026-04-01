@@ -1,275 +1,434 @@
-mod api;
-mod note;
-mod agents;
-mod store;
+/// Klyde Reader — a terminal book reader for Klyde.md
+///
+/// Controls:
+///   ↓ / j / Space / Enter   next page
+///   ↑ / k / Backspace        previous page
+///   g                        go to first page
+///   G                        go to last page
+///   q / Esc                  quit
 
-use clap::{Parser, Subcommand};
-use colored::Colorize;
-use std::env;
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    execute, queue,
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    terminal::{self, ClearType},
+};
+use std::{
+    fs,
+    io::{self, Write},
+};
+use textwrap::wrap;
 
-#[derive(Parser)]
-#[command(name = "note-organizer")]
-#[command(about = "AI-powered note organizer using Claude agents")]
-#[command(version = "0.1.0")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
+const FILE: &str = "Klyde.md";
+// Columns reserved for the left/right border padding
+const H_PADDING: usize = 4; // 2 spaces each side inside the border
+// Rows reserved for: top border + title bar + divider + bottom divider + status + bottom border
+const V_OVERHEAD: usize = 6;
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Add a new note
-    Add {
-        /// Note title
-        #[arg(short, long)]
-        title: String,
-        /// Note content
-        #[arg(short, long)]
-        content: String,
-    },
-    /// List all notes
-    List {
-        /// Filter by tag
-        #[arg(short, long)]
-        tag: Option<String>,
-    },
-    /// Show a note by ID or title fragment
-    Show {
-        /// Note ID or title fragment
-        query: String,
-    },
-    /// Search notes using AI semantic search
-    Search {
-        /// Search query
-        query: String,
-    },
-    /// Organize all notes with AI (auto-tag, categorize, summarize)
-    Organize,
-    /// Ask the AI assistant about your notes
-    Ask {
-        /// Your question
-        question: String,
-    },
-    /// Delete a note by ID
-    Delete {
-        /// Note ID
-        id: String,
-    },
-    /// Show stats about your notes collection
-    Stats,
-}
-
-#[tokio::main]
-async fn main() {
-    let cli = Cli::parse();
-
-    if env::var("ANTHROPIC_API_KEY").is_err() {
-        eprintln!("{}", "Error: ANTHROPIC_API_KEY environment variable not set.".red().bold());
-        eprintln!("Set it with: export ANTHROPIC_API_KEY=your-key-here");
+fn main() -> io::Result<()> {
+    // ── Load file ──────────────────────────────────────────────────────────
+    let raw = fs::read_to_string(FILE).unwrap_or_else(|_| {
+        eprintln!("Cannot open '{}'. Place Klyde.md in the current directory.", FILE);
         std::process::exit(1);
-    }
+    });
 
-    let store = store::NoteStore::load().expect("Failed to load note store");
+    // ── Render markdown lines into display lines ───────────────────────────
+    let (cols, rows) = terminal::size()?;
+    let inner_width = cols as usize - H_PADDING - 2; // 2 for the side borders
+    let page_height = rows as usize - V_OVERHEAD;
 
-    match cli.command {
-        Commands::Add { title, content } => {
-            cmd_add(store, title, content).await;
-        }
-        Commands::List { tag } => {
-            cmd_list(store, tag);
-        }
-        Commands::Show { query } => {
-            cmd_show(store, query);
-        }
-        Commands::Search { query } => {
-            cmd_search(store, query).await;
-        }
-        Commands::Organize => {
-            cmd_organize(store).await;
-        }
-        Commands::Ask { question } => {
-            cmd_ask(store, question).await;
-        }
-        Commands::Delete { id } => {
-            cmd_delete(store, id);
-        }
-        Commands::Stats => {
-            cmd_stats(store);
-        }
-    }
-}
+    let display_lines = render_md(&raw, inner_width);
+    let pages = paginate(&display_lines, page_height);
+    let total_pages = pages.len().max(1);
 
-async fn cmd_add(mut store: store::NoteStore, title: String, content: String) {
-    println!("{}", "Analyzing your note with AI...".cyan());
-    let note = agents::tagger_agent(&title, &content).await
-        .unwrap_or_else(|e| {
-            eprintln!("{}: {}", "Warning: AI tagging failed".yellow(), e);
-            note::Note::new(title, content, vec![], None, None)
-        });
+    // ── Enter raw/alternate-screen mode ───────────────────────────────────
+    terminal::enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
 
-    println!("{} {}", "Category:".dimmed(), note.category.as_deref().unwrap_or("uncategorized").blue());
-    println!("{} {}", "Tags:".dimmed(), note.tags.join(", ").green());
-    if let Some(ref summary) = note.summary {
-        println!("{} {}", "Summary:".dimmed(), summary.italic());
-    }
+    let mut page: usize = 0;
+    draw_page(&mut stdout, &pages, page, total_pages, cols, rows)?;
 
-    let id = note.id.clone();
-    store.add(note);
-    store.save().expect("Failed to save note store");
-    println!("{} Note saved with ID: {}", "✓".green().bold(), id.yellow());
-}
-
-fn cmd_list(store: store::NoteStore, tag: Option<String>) {
-    let notes = store.list(tag.as_deref());
-    if notes.is_empty() {
-        println!("{}", "No notes found.".dimmed());
-        return;
-    }
-    println!("{}", format!("Found {} note(s):", notes.len()).bold());
-    println!();
-    for n in notes {
-        let tags_display = if n.tags.is_empty() {
-            "no tags".dimmed().to_string()
-        } else {
-            n.tags.join(", ").green().to_string()
-        };
-        println!(
-            "{} {} [{}]",
-            n.id[..8].yellow(),
-            n.title.bold(),
-            tags_display
-        );
-        if let Some(ref summary) = n.summary {
-            println!("   {}", summary.italic().dimmed());
-        }
-        println!(
-            "   {} {}",
-            "Category:".dimmed(),
-            n.category.as_deref().unwrap_or("none").blue()
-        );
-        println!();
-    }
-}
-
-fn cmd_show(store: store::NoteStore, query: String) {
-    match store.find(&query) {
-        Some(n) => {
-            println!("{}", "─".repeat(60).dimmed());
-            println!("{} {}", "ID:".dimmed(), n.id.yellow());
-            println!("{} {}", "Title:".dimmed(), n.title.bold());
-            println!("{} {}", "Created:".dimmed(), n.created_at.format("%Y-%m-%d %H:%M").to_string().dimmed());
-            println!("{} {}", "Category:".dimmed(), n.category.as_deref().unwrap_or("none").blue());
-            println!("{} {}", "Tags:".dimmed(), if n.tags.is_empty() { "none".to_string() } else { n.tags.join(", ").green().to_string() });
-            if let Some(ref summary) = n.summary {
-                println!("{} {}", "Summary:".dimmed(), summary.italic());
+    loop {
+        if let Event::Key(KeyEvent { code, modifiers, .. }) = event::read()? {
+            // Ctrl-C always quits
+            if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+                break;
             }
-            println!("{}", "─".repeat(60).dimmed());
-            println!("{}", n.content);
-        }
-        None => {
-            println!("{}", format!("No note found matching: {}", query).red());
+            match code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Down
+                | KeyCode::Char('j')
+                | KeyCode::Char(' ')
+                | KeyCode::Enter
+                | KeyCode::PageDown => {
+                    if page + 1 < total_pages {
+                        page += 1;
+                        draw_page(&mut stdout, &pages, page, total_pages, cols, rows)?;
+                    }
+                }
+                KeyCode::Up
+                | KeyCode::Char('k')
+                | KeyCode::Backspace
+                | KeyCode::PageUp => {
+                    if page > 0 {
+                        page -= 1;
+                        draw_page(&mut stdout, &pages, page, total_pages, cols, rows)?;
+                    }
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    page = 0;
+                    draw_page(&mut stdout, &pages, page, total_pages, cols, rows)?;
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    page = total_pages - 1;
+                    draw_page(&mut stdout, &pages, page, total_pages, cols, rows)?;
+                }
+                _ => {}
+            }
         }
     }
+
+    // ── Restore terminal ───────────────────────────────────────────────────
+    execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show)?;
+    terminal::disable_raw_mode()?;
+    Ok(())
 }
 
-async fn cmd_search(store: store::NoteStore, query: String) {
-    println!("{}", "Searching notes with AI...".cyan());
-    let notes = store.all();
-    if notes.is_empty() {
-        println!("{}", "No notes to search.".dimmed());
-        return;
+// ── Rendering ──────────────────────────────────────────────────────────────
+
+/// A line ready to print, with optional style hints.
+#[derive(Clone)]
+enum Line {
+    Blank,
+    H1(String),
+    H2(String),
+    H3(String),
+    Rule,
+    Body(String),
+    Bold(String),  // lines that are entirely bold (e.g. **…** standalone)
+    Code(String),  // inline code / code block lines
+}
+
+/// Turn raw markdown text into styled display lines, word-wrapped to `width`.
+fn render_md(src: &str, width: usize) -> Vec<Line> {
+    let mut out: Vec<Line> = Vec::new();
+    let mut in_code_block = false;
+
+    for raw_line in src.lines() {
+        // Code fences
+        if raw_line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            out.push(Line::Code(raw_line.to_string()));
+            continue;
+        }
+
+        // Blank line
+        if raw_line.trim().is_empty() {
+            out.push(Line::Blank);
+            continue;
+        }
+
+        // Horizontal rule
+        if raw_line.trim() == "---" || raw_line.trim() == "***" || raw_line.trim() == "___" {
+            out.push(Line::Rule);
+            continue;
+        }
+
+        // Headings
+        if let Some(h) = raw_line.strip_prefix("### ") {
+            out.push(Line::H3(h.trim().to_string()));
+            continue;
+        }
+        if let Some(h) = raw_line.strip_prefix("## ") {
+            out.push(Line::Blank);
+            out.push(Line::H2(h.trim().to_string()));
+            out.push(Line::Blank);
+            continue;
+        }
+        if let Some(h) = raw_line.strip_prefix("# ") {
+            out.push(Line::Blank);
+            out.push(Line::H1(h.trim().to_string()));
+            out.push(Line::Blank);
+            continue;
+        }
+
+        // Detect if the whole line is **bold** or __bold__
+        let trimmed = raw_line.trim();
+        if (trimmed.starts_with("**") && trimmed.ends_with("**") && trimmed.len() > 4)
+            || (trimmed.starts_with("__") && trimmed.ends_with("__") && trimmed.len() > 4)
+        {
+            let inner = trimmed[2..trimmed.len() - 2].to_string();
+            for wrapped in wrap(&inner, width) {
+                out.push(Line::Bold(wrapped.to_string()));
+            }
+            continue;
+        }
+
+        // Regular body text — strip inline markdown markers for clean display
+        let clean = strip_inline_md(raw_line.trim());
+        for wrapped in wrap(&clean, width) {
+            out.push(Line::Body(wrapped.to_string()));
+        }
     }
-    match agents::search_agent(&query, &notes).await {
-        Ok(results) => {
-            if results.is_empty() {
-                println!("{}", "No matching notes found.".dimmed());
-            } else {
-                println!("{}", format!("Found {} relevant note(s):", results.len()).bold());
-                for (note, explanation) in results {
-                    println!();
-                    println!("{} {}", note.id[..8].yellow(), note.title.bold());
-                    println!("   {}", explanation.italic().dimmed());
+
+    out
+}
+
+/// Strip inline markdown markers (bold, italic, inline code, links).
+fn strip_inline_md(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        // Bold/italic: ** or __
+        if i + 1 < chars.len()
+            && ((chars[i] == '*' && chars[i + 1] == '*')
+                || (chars[i] == '_' && chars[i + 1] == '_'))
+        {
+            i += 2;
+            continue;
+        }
+        // Single * or _
+        if chars[i] == '*' || chars[i] == '_' {
+            i += 1;
+            continue;
+        }
+        // Inline code `…`
+        if chars[i] == '`' {
+            i += 1;
+            continue;
+        }
+        // Markdown link [text](url) → keep text
+        if chars[i] == '[' {
+            i += 1;
+            let mut text = String::new();
+            while i < chars.len() && chars[i] != ']' {
+                text.push(chars[i]);
+                i += 1;
+            }
+            // skip ](url)
+            if i < chars.len() && chars[i] == ']' {
+                i += 1;
+                if i < chars.len() && chars[i] == '(' {
+                    i += 1;
+                    while i < chars.len() && chars[i] != ')' {
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        i += 1;
+                    }
                 }
             }
+            out.push_str(&text);
+            continue;
         }
-        Err(e) => eprintln!("{}: {}", "Search failed".red(), e),
+        out.push(chars[i]);
+        i += 1;
     }
+    out
 }
 
-async fn cmd_organize(mut store: store::NoteStore) {
-    let notes = store.all_mut();
-    if notes.is_empty() {
-        println!("{}", "No notes to organize.".dimmed());
-        return;
+/// Split display lines into pages of `height` lines each.
+fn paginate(lines: &[Line], height: usize) -> Vec<Vec<Line>> {
+    if height == 0 || lines.is_empty() {
+        return vec![lines.to_vec()];
     }
-    println!("{}", format!("Organizing {} note(s) with AI...", notes.len()).cyan());
-    match agents::organizer_agent(notes).await {
-        Ok(updated) => {
-            let count = updated.len();
-            store.replace_all(updated);
-            store.save().expect("Failed to save");
-            println!("{} Organized {} note(s) with updated tags, categories, and summaries.", "✓".green().bold(), count);
-        }
-        Err(e) => eprintln!("{}: {}", "Organization failed".red(), e),
-    }
+    lines.chunks(height).map(|c| c.to_vec()).collect()
 }
 
-async fn cmd_ask(store: store::NoteStore, question: String) {
-    let notes = store.all();
-    println!("{}", "Consulting AI assistant...".cyan());
-    match agents::qa_agent(&question, &notes).await {
-        Ok(answer) => {
-            println!();
-            println!("{}", answer);
+// ── Drawing ────────────────────────────────────────────────────────────────
+
+fn draw_page(
+    stdout: &mut impl Write,
+    pages: &[Vec<Line>],
+    page: usize,
+    total: usize,
+    cols: u16,
+    rows: u16,
+) -> io::Result<()> {
+    let w = cols as usize;
+
+    queue!(stdout, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+
+    // ── Top border + title ─────────────────────────────────────────────────
+    draw_box_top(stdout, w)?;
+    draw_title_bar(stdout, FILE, w)?;
+    draw_box_mid(stdout, w)?;
+
+    // ── Content ────────────────────────────────────────────────────────────
+    let page_height = rows as usize - V_OVERHEAD;
+    let empty_page: Vec<Line> = vec![];
+    let lines = pages.get(page).unwrap_or(&empty_page);
+
+    for i in 0..page_height {
+        queue!(
+            stdout,
+            SetForegroundColor(Color::DarkGrey),
+            Print("│"),
+            ResetColor,
+        )?;
+
+        if let Some(line) = lines.get(i) {
+            draw_line(stdout, line, w)?;
+        } else {
+            // Empty row padding
+            queue!(stdout, Print(format!("{:width$}", "", width = w - 2)))?;
         }
-        Err(e) => eprintln!("{}: {}", "Failed".red(), e),
+
+        queue!(
+            stdout,
+            SetForegroundColor(Color::DarkGrey),
+            Print("│\r\n"),
+            ResetColor,
+        )?;
     }
+
+    // ── Bottom divider + status bar ────────────────────────────────────────
+    draw_box_mid(stdout, w)?;
+    draw_status_bar(stdout, page, total, w)?;
+    draw_box_bottom(stdout, w)?;
+
+    stdout.flush()
 }
 
-fn cmd_delete(mut store: store::NoteStore, id: String) {
-    if store.delete(&id) {
-        store.save().expect("Failed to save");
-        println!("{} Note deleted.", "✓".green().bold());
-    } else {
-        println!("{}", format!("No note found with ID: {}", id).red());
-    }
-}
+fn draw_line(stdout: &mut impl Write, line: &Line, w: usize) -> io::Result<()> {
+    let inner = w - 2; // subtract side borders
+    let pad = 2usize;  // left padding inside border
 
-fn cmd_stats(store: store::NoteStore) {
-    let notes = store.all();
-    let total = notes.len();
-    if total == 0 {
-        println!("{}", "No notes yet.".dimmed());
-        return;
-    }
-
-    let mut categories: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut all_tags: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-
-    for n in &notes {
-        let cat = n.category.clone().unwrap_or_else(|| "uncategorized".to_string());
-        *categories.entry(cat).or_insert(0) += 1;
-        for tag in &n.tags {
-            *all_tags.entry(tag.clone()).or_insert(0) += 1;
+    match line {
+        Line::Blank => {
+            queue!(stdout, Print(format!("{:width$}", "", width = inner)))?;
+        }
+        Line::Rule => {
+            let rule = format!(
+                "{}{}{} ",
+                " ".repeat(pad),
+                "─".repeat(inner - pad - 1),
+                " "
+            );
+            queue!(
+                stdout,
+                SetForegroundColor(Color::DarkGrey),
+                Print(format!("{:<width$}", rule, width = inner)),
+                ResetColor,
+            )?;
+        }
+        Line::H1(text) => {
+            let padded = format!("{}{}", " ".repeat(pad), text);
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Cyan),
+                SetAttribute(Attribute::Bold),
+                Print(format!("{:<width$}", padded, width = inner)),
+                SetAttribute(Attribute::Reset),
+                ResetColor,
+            )?;
+        }
+        Line::H2(text) => {
+            let padded = format!("{}{}", " ".repeat(pad), text);
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Yellow),
+                SetAttribute(Attribute::Bold),
+                Print(format!("{:<width$}", padded, width = inner)),
+                SetAttribute(Attribute::Reset),
+                ResetColor,
+            )?;
+        }
+        Line::H3(text) => {
+            let padded = format!("{}{}", " ".repeat(pad), text);
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Green),
+                Print(format!("{:<width$}", padded, width = inner)),
+                ResetColor,
+            )?;
+        }
+        Line::Bold(text) => {
+            let padded = format!("{}{}", " ".repeat(pad), text);
+            queue!(
+                stdout,
+                SetAttribute(Attribute::Bold),
+                Print(format!("{:<width$}", padded, width = inner)),
+                SetAttribute(Attribute::Reset),
+            )?;
+        }
+        Line::Code(text) => {
+            let padded = format!("{}{}", " ".repeat(pad), text);
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Magenta),
+                Print(format!("{:<width$}", padded, width = inner)),
+                ResetColor,
+            )?;
+        }
+        Line::Body(text) => {
+            let padded = format!("{}{}", " ".repeat(pad), text);
+            queue!(stdout, Print(format!("{:<width$}", padded, width = inner)))?;
         }
     }
 
-    println!("{}", "─".repeat(40).dimmed());
-    println!("{}", "Note Statistics".bold());
-    println!("{}", "─".repeat(40).dimmed());
-    println!("{} {}", "Total notes:".dimmed(), total.to_string().yellow().bold());
-    println!();
-    println!("{}", "Categories:".bold());
-    let mut cats: Vec<_> = categories.iter().collect();
-    cats.sort_by(|a, b| b.1.cmp(a.1));
-    for (cat, count) in cats {
-        println!("  {} {}", format!("{}", count).yellow(), cat.blue());
-    }
-    println!();
-    println!("{}", "Top Tags:".bold());
-    let mut tags: Vec<_> = all_tags.iter().collect();
-    tags.sort_by(|a, b| b.1.cmp(a.1));
-    for (tag, count) in tags.iter().take(10) {
-        println!("  {} {}", format!("{}", count).yellow(), tag.green());
-    }
+    Ok(())
+}
+
+// ── Box-drawing helpers ─────────────────────────────────────────────────────
+
+fn draw_box_top(stdout: &mut impl Write, w: usize) -> io::Result<()> {
+    let line = format!("╔{}╗\r\n", "═".repeat(w - 2));
+    queue!(stdout, SetForegroundColor(Color::DarkGrey), Print(line), ResetColor)
+}
+
+fn draw_box_mid(stdout: &mut impl Write, w: usize) -> io::Result<()> {
+    let line = format!("╠{}╣\r\n", "═".repeat(w - 2));
+    queue!(stdout, SetForegroundColor(Color::DarkGrey), Print(line), ResetColor)
+}
+
+fn draw_box_bottom(stdout: &mut impl Write, w: usize) -> io::Result<()> {
+    let line = format!("╚{}╝\r\n", "═".repeat(w - 2));
+    queue!(stdout, SetForegroundColor(Color::DarkGrey), Print(line), ResetColor)
+}
+
+fn draw_title_bar(stdout: &mut impl Write, title: &str, w: usize) -> io::Result<()> {
+    let inner = w - 2;
+    let title_str = format!("  📖  {}", title);
+    queue!(
+        stdout,
+        SetForegroundColor(Color::DarkGrey),
+        Print("║"),
+        ResetColor,
+        SetForegroundColor(Color::White),
+        SetAttribute(Attribute::Bold),
+        Print(format!("{:<width$}", title_str, width = inner)),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        SetForegroundColor(Color::DarkGrey),
+        Print("║\r\n"),
+        ResetColor,
+    )
+}
+
+fn draw_status_bar(stdout: &mut impl Write, page: usize, total: usize, w: usize) -> io::Result<()> {
+    let inner = w - 2;
+    let left = format!("  Page {} / {}", page + 1, total);
+    let right = "  [↑/↓] scroll   [g] start   [G] end   [q] quit  ";
+    let gap = inner.saturating_sub(left.len() + right.len());
+    let bar = format!("{}{}{}", left, " ".repeat(gap), right);
+
+    queue!(
+        stdout,
+        SetForegroundColor(Color::DarkGrey),
+        Print("║"),
+        ResetColor,
+        SetForegroundColor(Color::DarkGrey),
+        Print(format!("{:<width$}", bar, width = inner)),
+        ResetColor,
+        SetForegroundColor(Color::DarkGrey),
+        Print("║\r\n"),
+        ResetColor,
+    )
 }
