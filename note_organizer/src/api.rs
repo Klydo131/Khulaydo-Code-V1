@@ -4,7 +4,9 @@ use serde_json::{json, Value};
 use std::env;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
-const MODEL: &str = "claude-opus-4-6";
+// Haiku is the lowest-cost Claude model ($1.00 input / $5.00 output per 1M tokens).
+// All four agents use it to keep per-operation costs in the fractions-of-a-cent range.
+const MODEL: &str = "claude-haiku-4-5";
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -46,7 +48,6 @@ pub async fn call_claude(
     let body = json!({
         "model": MODEL,
         "max_tokens": max_tokens,
-        "thinking": {"type": "adaptive"},
         "system": system,
         "messages": msgs
     });

@@ -30,7 +30,7 @@ Rules:
 
 pub async fn tagger_agent(title: &str, content: &str) -> Result<Note, ApiError> {
     let prompt = format!("Title: {}\n\nContent:\n{}", title, content);
-    let raw = api::ask(TAGGER_SYSTEM, &prompt, 1024).await?;
+    let raw = api::ask(TAGGER_SYSTEM, &prompt, 512).await?;
 
     let json: Value = parse_json(&raw)
         .map_err(|e| ApiError::Parse(format!("Tagger response not valid JSON: {} | raw: {}", e, raw)))?;
@@ -76,7 +76,7 @@ pub async fn organizer_agent(notes: Vec<Note>) -> Result<Vec<Note>, ApiError> {
         .join("\n");
 
     let prompt = format!("Organize these notes:\n\n{}", notes_text);
-    let raw = api::ask(ORGANIZER_SYSTEM, &prompt, 4096).await?;
+    let raw = api::ask(ORGANIZER_SYSTEM, &prompt, 2048).await?;
 
     let json: Value = parse_json(&raw)
         .map_err(|e| ApiError::Parse(format!("Organizer response not valid JSON: {} | raw: {}", e, raw)))?;
@@ -142,7 +142,7 @@ pub async fn search_agent<'a>(
         .join("\n");
 
     let prompt = format!("Query: {}\n\nNotes:\n{}", query, notes_text);
-    let raw = api::ask(SEARCH_SYSTEM, &prompt, 2048).await?;
+    let raw = api::ask(SEARCH_SYSTEM, &prompt, 1024).await?;
 
     let json: Value = parse_json(&raw)
         .map_err(|e| ApiError::Parse(format!("Search response not valid JSON: {} | raw: {}", e, raw)))?;
@@ -196,7 +196,7 @@ pub async fn qa_agent(question: &str, notes: &[&Note]) -> Result<String, ApiErro
         notes_context, question
     );
 
-    api::ask(QA_SYSTEM, &prompt, 2048).await
+    api::ask(QA_SYSTEM, &prompt, 1024).await
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

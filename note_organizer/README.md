@@ -10,6 +10,22 @@ An AI-powered CLI note organizer built in Rust, using Claude as the AI backend.
 - **Q&A assistant** — Ask questions about your notes in natural language
 - **Local storage** — Notes saved as JSON in your OS data directory (no cloud sync)
 
+## API Cost
+
+This tool uses **Claude Haiku** — Anthropic's cheapest model ($1.00 input / $5.00 output per 1M tokens).
+
+Typical costs per operation:
+| Command | Approx. cost |
+|---------|-------------|
+| `add` (tag + summarize) | ~$0.0001 |
+| `search` | ~$0.0002 |
+| `ask` | ~$0.0002 |
+| `organize` (10 notes) | ~$0.001 |
+
+New Anthropic accounts receive free credits that cover hundreds of operations before any charge applies. After that, costs are in the fractions-of-a-cent range for normal personal use.
+
+**There is no completely free API tier** — you need an [Anthropic account](https://console.anthropic.com) and API key.
+
 ## Setup
 
 ```bash
