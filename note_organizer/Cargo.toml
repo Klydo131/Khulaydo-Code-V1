@@ -1,0 +1,13 @@
+[package]
+name = "klyde-reader"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal book reader for Klyde.md"
+
+[[bin]]
+name = "klyde-reader"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.28"
+textwrap = "0.16"
